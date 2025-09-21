@@ -318,17 +318,6 @@ minetest.register_on_leaveplayer(function(player, timed_out)
     MatrixChat:send("[Server]: " .. name .. " left the game" .. (timed_out and " (Timed out)" or ", see you again soon!"))
 end)
 
-if not chat_channels then
-    minetest.register_on_chat_message(function(name, message)
-        if message:sub(1, 1) == "/" or message:sub(1, 5) == "[off]" or not minetest.check_player_privs(name, {shout = true}) then
-            return
-        end
-        local nl = message:find("\n", 1, true)
-        if nl then message = message:sub(1, nl - 1) end
-        MatrixChat:send("[" .. name .. "]: " .. message)
-    end)
-end
-
 minetest.register_chatcommand("restart", {
     params = "<message>",
     description = "Send a restart message and shut down the server",

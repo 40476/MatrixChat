@@ -30,10 +30,16 @@ local MatrixChat = {
 }
 matrix_bridge = {}
 
-function matrix_bridge.send_to_room(message)
+function matrix_bridge.send_as_server(message)
     -- Your existing Matrix bot logic here
     -- For example:
     MatrixChat:send("[Server]: " .. message)
+end
+
+function matrix_bridge.send_raw(message)
+    -- Your existing Matrix bot logic here
+    -- For example:
+    MatrixChat:send(message)
 end
 
 function MatrixChat:join_room()
@@ -289,6 +295,16 @@ minetest.register_chatcommand("matrix", {
 
 -- Wrap mod init in xpcall
 local function safe_mod_init()
+    if rawget(_G, "chat_channels") == nil then
+        minetest.register_on_chat_message(function(name, message)
+        if message:sub(1, 1) == "/" or message:sub(1, 5) == "[off]" or not minetest.check_player_privs(name, {shout = true}) then
+            return
+        end
+        local nl = message:find("\n", 1, true)
+        if nl then message = message:sub(1, nl - 1) end
+        MatrixChat:send("[" .. name .. "]: " .. message)
+        end)
+    end
     MatrixChat:login()
 end
 
@@ -300,15 +316,6 @@ end)
 minetest.register_on_leaveplayer(function(player, timed_out)
     local name = player:get_player_name()
     MatrixChat:send("[Server]: " .. name .. " left the game" .. (timed_out and " (Timed out)" or ", see you again soon!"))
-end)
-
-minetest.register_on_chat_message(function(name, message)
-    if message:sub(1, 1) == "/" or message:sub(1, 5) == "[off]" or not minetest.check_player_privs(name, {shout = true}) then
-        return
-    end
-    local nl = message:find("\n", 1, true)
-    if nl then message = message:sub(1, nl - 1) end
-    MatrixChat:send("[" .. name .. "]: " .. message)
 end)
 
 minetest.register_chatcommand("restart", {

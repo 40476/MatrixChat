@@ -10,7 +10,6 @@ MATRIX_PASSWORD = minetest.settings:get("MATRIX_PASSWORD")
 MATRIX_TOKEN = minetest.settings:get("MATRIX_TOKEN")
 MATRIX_USERID = minetest.settings:get("MATRIX_USERID")
 
-
 local http = minetest.request_http_api()
 if not http then
     error("Please add matrix_bridge to secure.http_mods")
@@ -94,7 +93,6 @@ end
 function MatrixChat:join_room()
     if not self.room or not self.token then return end
     
-    -- This uses the function defined at line 18 of your file
     local encoded_room = url_encode(self.room)
     local url = self.server .. "/_matrix/client/v3/join/" .. encoded_room
     
@@ -146,7 +144,8 @@ function MatrixChat:get_sync_table(timeout)
     if self.since and self.since ~= "" then table.insert(params, "since=" .. url_encode(self.since)) end
     if timeout then table.insert(params, "timeout=" .. timeout) end
     
-    local url = self.server .. "/_matrix/client/v1/sync"
+    -- REVERTED: Changed back to /v3/sync which is natively supported
+    local url = self.server .. "/_matrix/client/v3/sync"
     if #params > 0 then url = url .. "?" .. table.concat(params, "&") end
     
     local headers = {
@@ -164,7 +163,6 @@ end
 -- Perform sync
 function MatrixChat:sync(timeout)
     if not self.token then return end
-    -- If the async handle is stuck or threw a 405, reset it
     HANDLE = nil 
     
     http.fetch(self:get_sync_table(timeout), function(res)
@@ -181,6 +179,11 @@ function MatrixChat:sync(timeout)
             end
         else
             minetest.log("error", "matrix_bridge - manual sync failed with code " .. res.code)
+            -- Clear out corrupted sync token if the host flags it as bad
+            if res.code == 400 or res.code == 405 then
+                self.since = nil
+                self:save_session()
+            end
         end
     end)
 end
@@ -192,7 +195,6 @@ function MatrixChat:login()
         return
     end
 
-    -- Attempt to load existing session or token first
     if self:load_session() then
         minetest.log("action", "matrix_bridge - Logged in using saved session/token")
         self:join_room()
@@ -200,8 +202,6 @@ function MatrixChat:login()
         return
     end
 
-    -- Fallback to password login if no token is available
-    -- Minetest returns "" for empty settings, so we must explicitly check for empty strings
     if not self.username or self.username == "" or not self.password or self.password == "" then
         minetest.log("error", "matrix_bridge - No token available and missing username/password in settings.")
         return
@@ -228,7 +228,7 @@ function MatrixChat:login()
             if data and data.access_token and data.user_id then
                 self.token = data.access_token
                 self.userid = data.user_id
-                self:save_session() -- Persist session for future server restarts
+                self:save_session() 
                 minetest.log("action", "matrix_bridge - Matrix authenticated with password")
                 self:join_room()
                 self:sync()
@@ -244,7 +244,7 @@ end
 -- Send message to Matrix room
 function MatrixChat:send(msg)
     if not self.token then return end
-    local txid = tostring(os.time())
+    local txid = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
     local url = self.server .. "/_matrix/client/r0/rooms/" .. self.room .. "/send/m.room.message/" .. txid
     local headers = {
         "Authorization: Bearer " .. self.token,
@@ -291,7 +291,7 @@ function MatrixChat:logout()
         "Accept-Encoding: identity"
     }
     http.fetch({url = url, method = "POST", extra_headers = headers}, function(_) end)
-    self:clear_session() -- Erase tokens locally
+    self:clear_session() 
     minetest.log("action", "matrix_bridge - signed out and session cleared")
 end
 
@@ -325,34 +325,29 @@ local function global_error_handler(err)
 end
 
 -- Periodic sync
-local INTERVAL = 30 -- Lowered to 30s to prevent HTTP gateway timeouts entirely
+local INTERVAL = 30 
 local HANDLE = nil
 local sync_cooldown = 0
 
 minetest.register_globalstep(function(dtime)
-    -- 1. If we are on cooldown, tick down the timer and get out
     if sync_cooldown > 0 then
         sync_cooldown = sync_cooldown - dtime
         return
     end
 
-    -- 2. Safety check: Don't sync if nobody is online or we aren't logged in
     if not MatrixChat.token or #minetest.get_connected_players() == 0 then 
-        if HANDLE then HANDLE = nil end -- Clear any dangling handles if server goes empty
+        if HANDLE then HANDLE = nil end 
         return 
     end
     
-    -- 3. If NO request is out, spawn ONE request
     if HANDLE == nil then
         local request = MatrixChat:get_sync_table(INTERVAL * 1000)
         request.method = "GET" 
         HANDLE = http.fetch_async(request)
     else
-        -- 4. A request is out, let's poll it safely
         local result = http.fetch_async_get(HANDLE)
         
         if result and result.completed then
-            -- Immediately clear the handle so no other ticks can read this completed state
             HANDLE = nil 
             
             if result.code == 200 then
@@ -364,16 +359,23 @@ minetest.register_globalstep(function(dtime)
                         MatrixChat:save_session()
                     end
                 end
-                sync_cooldown = 0 -- Perfect sync! Clear any cooldowns
+                sync_cooldown = 0 
             else
                 minetest.log("error", "[matrix_bridge] background sync failed with code " .. tostring(result.code))
                 
-                -- Force a strict backoff delay if the server tells us to back off (0 or 405)
-                if result.code == 0 or result.code == 405 then
-                    minetest.log("action", "[matrix_bridge] Rate limit/Timeout hit. Cooling down for 15 seconds...")
+                -- Catch ALL major failure states (Timeouts, 404, 405) and drop into cooldown
+                if result.code == 0 or result.code == 405 or result.code == 404 then
+                    minetest.log("action", "[matrix_bridge] Sync issues hit. Resetting tracking and cooling down for 15 seconds...")
+                    
+                    -- Wipe out a potentially corrupted since token on validation/routing fault
+                    if result.code == 405 then
+                        MatrixChat.since = nil
+                        MatrixChat:save_session()
+                    end
+                    
                     sync_cooldown = 15
                 else
-                    sync_cooldown = 5 -- Generic error penalty
+                    sync_cooldown = 5 
                 end
             end
         end

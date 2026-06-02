@@ -111,6 +111,7 @@ function MatrixChat:join_room()
             if data and data.room_id then
                 self.room = data.room_id -- CRITICAL: Swaps alias for real ID
                 minetest.log("action", "[matrix_bridge] Joined! Room ID is now: " .. self.room)
+                matrix_bridge.send_as_server("Server is online!")
             end
         else
             minetest.log("error", "[matrix_bridge] Join failed: " .. res.code .. " " .. (res.data or ""))
@@ -129,7 +130,11 @@ function MatrixChat:minechat(data)
     for _, event in ipairs(timeline.events) do
         if event.type == "m.room.message" and event.sender ~= self.userid then
             local message = event.sender .. ": " .. event.content.body
-            minetest.chat_send_all(message)
+            if chat_channels then
+                chat_channels.send("Matrix Bridge", "general", message)
+            else
+                minetest.chat_send_all(message)
+            end
         end
     end
 end
@@ -137,20 +142,30 @@ end
 -- Build sync request
 function MatrixChat:get_sync_table(timeout)
     local params = {}
-    if self.since then table.insert(params, "since=" .. self.since) end
+    if self.since and self.since ~= "" then table.insert(params, "since=" .. url_encode(self.since)) end
     if timeout then table.insert(params, "timeout=" .. timeout) end
+    
     local url = self.server .. "/_matrix/client/v3/sync"
     if #params > 0 then url = url .. "?" .. table.concat(params, "&") end
+    
     local headers = {
         "Authorization: Bearer " .. self.token,
         "Accept-Encoding: identity"
     }
-    return {url = url, method = "GET", extra_headers = headers}
+    
+    return {
+        url = url, 
+        method = "GET", -- Force GET explicitly
+        extra_headers = headers
+    }
 end
 
 -- Perform sync
 function MatrixChat:sync(timeout)
     if not self.token then return end
+    -- If the async handle is stuck or threw a 405, reset it
+    HANDLE = nil 
+    
     http.fetch(self:get_sync_table(timeout), function(res)
         if not res then
             minetest.log("error", "matrix_bridge - sync response is nil")
@@ -158,11 +173,13 @@ function MatrixChat:sync(timeout)
             local response = minetest.parse_json(res.data)
             if response then
                 self:minechat(response)
-                self.since = response.next_batch
-                self:save_session() -- Save the new sync token
+                if response.next_batch then
+                    self.since = response.next_batch
+                    self:save_session()
+                end
             end
         else
-            minetest.log("error", "matrix_bridge - sync failed with code " .. res.code)
+            minetest.log("error", "matrix_bridge - manual sync failed with code " .. res.code)
         end
     end)
 end
@@ -311,21 +328,28 @@ local INTERVAL = 60
 local HANDLE = nil
 minetest.register_globalstep(function(dtime)
     if not MatrixChat.token or #minetest.get_connected_players() == 0 then return end
+    
     if not HANDLE then
         local request = MatrixChat:get_sync_table(INTERVAL * 1000)
-        request.timeout = INTERVAL
+        -- Set method inside the table explicitly for the async scheduler
+        request.method = "GET" 
         HANDLE = http.fetch_async(request)
     else
         local result = http.fetch_async_get(HANDLE)
-        if result.completed then
+        if result and result.completed then
             if result.code == 200 then
                 local activity = minetest.parse_json(result.data)
                 if activity then
                     MatrixChat:minechat(activity)
-                    MatrixChat.since = activity.next_batch
-                    MatrixChat:save_session() -- Save the new sync token
+                    if activity.next_batch then
+                        MatrixChat.since = activity.next_batch
+                        MatrixChat:save_session()
+                    end
                 end
+            else
+                minetest.log("error", "matrix_bridge - background sync failed with code " .. tostring(result.code))
             end
+            -- CRITICAL: Always clear the handle when a request completes, success or failure!
             HANDLE = nil
         end
     end

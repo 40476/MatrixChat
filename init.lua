@@ -96,7 +96,7 @@ function MatrixChat:join_room()
     
     -- This uses the function defined at line 18 of your file
     local encoded_room = url_encode(self.room)
-    local url = self.server .. "/_matrix/client/v1/join/" .. encoded_room
+    local url = self.server .. "/_matrix/client/v3/join/" .. encoded_room
     
     http.fetch({
         url = url,
@@ -146,7 +146,7 @@ function MatrixChat:get_sync_table(timeout)
     if self.since and self.since ~= "" then table.insert(params, "since=" .. url_encode(self.since)) end
     if timeout then table.insert(params, "timeout=" .. timeout) end
     
-    local url = self.server .. "/_matrix/client/v3/sync"
+    local url = self.server .. "/_matrix/client/v1/sync"
     if #params > 0 then url = url .. "?" .. table.concat(params, "&") end
     
     local headers = {

@@ -96,7 +96,7 @@ function MatrixChat:join_room()
     
     -- This uses the function defined at line 18 of your file
     local encoded_room = url_encode(self.room)
-    local url = self.server .. "/_matrix/client/v3/join/" .. encoded_room
+    local url = self.server .. "/_matrix/client/v1/join/" .. encoded_room
     
     http.fetch({
         url = url,

@@ -10,6 +10,7 @@ MATRIX_PASSWORD = minetest.settings:get("MATRIX_PASSWORD")
 MATRIX_TOKEN = minetest.settings:get("MATRIX_TOKEN")
 MATRIX_USERID = minetest.settings:get("MATRIX_USERID")
 
+
 local http = minetest.request_http_api()
 if not http then
     error("Please add matrix_bridge to secure.http_mods")
@@ -324,19 +325,36 @@ local function global_error_handler(err)
 end
 
 -- Periodic sync
-local INTERVAL = 60
+local INTERVAL = 30 -- Lowered to 30s to prevent HTTP gateway timeouts entirely
 local HANDLE = nil
+local sync_cooldown = 0
+
 minetest.register_globalstep(function(dtime)
-    if not MatrixChat.token or #minetest.get_connected_players() == 0 then return end
+    -- 1. If we are on cooldown, tick down the timer and get out
+    if sync_cooldown > 0 then
+        sync_cooldown = sync_cooldown - dtime
+        return
+    end
+
+    -- 2. Safety check: Don't sync if nobody is online or we aren't logged in
+    if not MatrixChat.token or #minetest.get_connected_players() == 0 then 
+        if HANDLE then HANDLE = nil end -- Clear any dangling handles if server goes empty
+        return 
+    end
     
-    if not HANDLE then
+    -- 3. If NO request is out, spawn ONE request
+    if HANDLE == nil then
         local request = MatrixChat:get_sync_table(INTERVAL * 1000)
-        -- Set method inside the table explicitly for the async scheduler
         request.method = "GET" 
         HANDLE = http.fetch_async(request)
     else
+        -- 4. A request is out, let's poll it safely
         local result = http.fetch_async_get(HANDLE)
+        
         if result and result.completed then
+            -- Immediately clear the handle so no other ticks can read this completed state
+            HANDLE = nil 
+            
             if result.code == 200 then
                 local activity = minetest.parse_json(result.data)
                 if activity then
@@ -346,11 +364,18 @@ minetest.register_globalstep(function(dtime)
                         MatrixChat:save_session()
                     end
                 end
+                sync_cooldown = 0 -- Perfect sync! Clear any cooldowns
             else
-                minetest.log("error", "matrix_bridge - background sync failed with code " .. tostring(result.code))
+                minetest.log("error", "[matrix_bridge] background sync failed with code " .. tostring(result.code))
+                
+                -- Force a strict backoff delay if the server tells us to back off (0 or 405)
+                if result.code == 0 or result.code == 405 then
+                    minetest.log("action", "[matrix_bridge] Rate limit/Timeout hit. Cooling down for 15 seconds...")
+                    sync_cooldown = 15
+                else
+                    sync_cooldown = 5 -- Generic error penalty
+                end
             end
-            -- CRITICAL: Always clear the handle when a request completes, success or failure!
-            HANDLE = nil
         end
     end
 end)

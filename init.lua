@@ -341,8 +341,13 @@ minetest.register_globalstep(function(dtime)
     end
     
     if HANDLE == nil then
+        -- Securely fetch a clean, properly formatted request table
         local request = MatrixChat:get_sync_table(INTERVAL * 1000)
-        request.method = "GET" 
+        
+        -- Explicitly sanitize and enforce GET method formatting for the engine
+        request.method = "GET"
+        request.post_data = nil 
+        
         HANDLE = http.fetch_async(request)
     else
         local result = http.fetch_async_get(HANDLE)
@@ -363,15 +368,12 @@ minetest.register_globalstep(function(dtime)
             else
                 minetest.log("error", "[matrix_bridge] background sync failed with code " .. tostring(result.code))
                 
-                -- Catch ALL major failure states (Timeouts, 404, 405) and drop into cooldown
+                -- Catch major failure states
                 if result.code == 0 or result.code == 405 or result.code == 404 then
-                    minetest.log("action", "[matrix_bridge] Sync issues hit. Resetting tracking and cooling down for 15 seconds...")
+                    minetest.log("action", "[matrix_bridge] Sync issues hit. Cooling down for 15 seconds...")
                     
-                    -- Wipe out a potentially corrupted since token on validation/routing fault
-                    if result.code == 405 then
-                        MatrixChat.since = nil
-                        MatrixChat:save_session()
-                    end
+                    -- REMOVED: Do not clear MatrixChat.since on 405 here, otherwise you invalidate 
+                    -- your tracking position just because the proxy/engine flipped the request type.
                     
                     sync_cooldown = 15
                 else

@@ -341,14 +341,14 @@ minetest.register_globalstep(function(dtime)
     end
     
     if HANDLE == nil then
-        -- Securely fetch a clean, properly formatted request table
-        local request = MatrixChat:get_sync_table(INTERVAL * 1000)
-        
-        -- Explicitly sanitize and enforce GET method formatting for the engine
-        request.method = "GET"
-        request.post_data = nil 
-        
-        HANDLE = http.fetch_async(request)
+            local request = MatrixChat:get_sync_table(INTERVAL * 1000)
+            
+            -- FORCE THE ENGINE TO ONLY SEE A GET REQUEST:
+            request.method = "GET"
+            request.post_data = nil
+            request.data = nil        -- Explicitly wipe this so curl doesn't default to POST
+            
+            HANDLE = http.fetch_async(request)
     else
         local result = http.fetch_async_get(HANDLE)
         

@@ -130,7 +130,7 @@ function MatrixChat:minechat(data)
         if event.type == "m.room.message" and event.sender ~= self.userid then
             local message = event.sender .. ": " .. event.content.body
             if chat_channels then
-                chat_channels.send("Matrix Bridge", "general", message)
+                chat_channels.send("Matrix Bridge", "global", message)
             else
                 minetest.chat_send_all(message)
             end

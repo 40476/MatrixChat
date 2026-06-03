@@ -125,14 +125,22 @@ function MatrixChat:minechat(data)
     if not timeline or not timeline.events then
         return
     end
+    
     minetest.log("action", "matrix_bridge - sync'd and found new messages")
     for _, event in ipairs(timeline.events) do
         if event.type == "m.room.message" and event.sender ~= self.userid then
-            local message = event.sender .. ": " .. event.content.body
-            if chat_channels then
-                chat_channels.send("Matrix Bridge", "global", message)
+            -- Clean the sender username handle (e.g., @usr40k:matrix.org -> usr40k)
+            local matrix_user = event.sender:match("@([^:]+):") or event.sender
+            local message_content = event.content.body
+            
+            if rawget(_G, "chat_channels") and chat_channels.send then
+                
+                -- Mode 2 prints to the channel but DOES NOT echo it back to the out-bound Matrix API
+                chat_channels.send(matrix_user, "global", message_content, 2)
             else
-                minetest.chat_send_all(message)
+                -- Native Luanti absolute fallback layout if chat_channels fails to resolve dynamically
+                local fallback_msg = "[Matrix] <" .. matrix_user .. ">: " .. message_content
+                minetest.chat_send_all(fallback_msg)
             end
         end
     end

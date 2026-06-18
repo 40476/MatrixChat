@@ -350,55 +350,55 @@ minetest.register_globalstep(function(dtime)
         return
     end
 
-    if not MatrixChat.token or #minetest.get_connected_players() == 0 then 
-        if HANDLE then HANDLE = nil end 
+    -- Skip if not logged in, no players online, or a sync is actively in progress
+    if not MatrixChat.token or #minetest.get_connected_players() == 0 or is_syncing then 
         return 
     end
     
-    if HANDLE == nil then
-            local request = MatrixChat:get_sync_table(INTERVAL * 1000)
-            
-            -- FORCE THE ENGINE TO ONLY SEE A GET REQUEST:
-            request.method = "GET"
-            request.post_data = nil
-            request.data = nil        -- Explicitly wipe this so curl doesn't default to POST
-            
-            HANDLE = http.fetch_async(request)
-    else
-        local result = http.fetch_async_get(HANDLE)
-        
-        if result and result.completed then
-            HANDLE = nil 
-            
-            if result.code == 200 then
-                local activity = minetest.parse_json(result.data)
-                if activity then
-                    MatrixChat:minechat(activity)
-                    if activity.next_batch then
-                        MatrixChat.since = activity.next_batch
-                        MatrixChat:save_session()
-                    end
-                end
-                sync_cooldown = 0 
-            else
-                minetest.log("error", "[matrix_bridge] background sync failed with code " .. tostring(result.code))
-                
-                -- Catch major failure states
-                if result.code == 0 or result.code == 405 or result.code == 404 then
-                    minetest.log("action", "[matrix_bridge] Sync issues hit. Cooling down for 15 seconds...")
-                    
-                    -- REMOVED: Do not clear MatrixChat.since on 405 here, otherwise you invalidate 
-                    -- your tracking position just because the proxy/engine flipped the request type.
-                    
-                    sync_cooldown = 15
-                else
-                    sync_cooldown = 5 
+    is_syncing = true
+
+    -- Get clean parameters
+    local raw_request = MatrixChat:get_sync_table(INTERVAL * 1000)
+    
+    -- Force-build a bulletproof GET request structure with absolutely NO extra data parameters
+    local clean_request = {
+        url = raw_request.url,
+        method = "GET",
+        extra_headers = raw_request.extra_headers
+    }
+
+    -- Use standard non-blocking fetch with callback instead of fetch_async_get
+    http.fetch(clean_request, function(res)
+        is_syncing = false -- Release lock immediately when response drops
+
+        if not res then
+            minetest.log("error", "[matrix_bridge] background sync response is nil")
+            sync_cooldown = 5
+            return
+        end
+
+        if res.code == 200 then
+            local activity = minetest.parse_json(res.data)
+            if activity then
+                MatrixChat:minechat(activity)
+                if activity.next_batch then
+                    MatrixChat.since = activity.next_batch
+                    MatrixChat:save_session()
                 end
             end
+            sync_cooldown = 0 
+        else
+            minetest.log("error", "[matrix_bridge] background sync failed with code " .. tostring(res.code))
+            
+            if res.code == 405 or res.code == 400 or res.code == 404 then
+                minetest.log("action", "[matrix_bridge] Hard routing issue. Cooling down for 15 seconds...")
+                sync_cooldown = 15
+            else
+                sync_cooldown = 5 
+            end
         end
-    end
+    end)
 end)
-
 -- Chat and player events
 minetest.register_privilege("matrix", {
     description = "Manage matrix bridge session",

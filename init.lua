@@ -1,232 +1,398 @@
+-- MatrixChat module for Minetest
 local modpath = minetest.get_modpath(minetest.get_current_modname())
+local storage = minetest.get_mod_storage()
 
--- Load settings directly from minetest.settings
-local MATRIX_SERVER = minetest.settings:get("MATRIX_SERVER")
-local MATRIX_ROOM = minetest.settings:get("MATRIX_ROOM")
-local MATRIX_USERNAME = minetest.settings:get("MATRIX_USERNAME")
-local MATRIX_PASSWORD = minetest.settings:get("MATRIX_PASSWORD")
-local MATRIX_TOKEN = minetest.settings:get("MATRIX_TOKEN")
-local MATRIX_USERID = minetest.settings:get("MATRIX_USERID")
-local MATRIX_SERVERNAME = minetest.settings:get("MATRIX_SERVERNAME") or "usr40k.dev"
+MATRIX_SERVER = minetest.settings:get("MATRIX_SERVER")
+MATRIX_ROOM = minetest.settings:get("MATRIX_ROOM")
+MATRIX_USERNAME = minetest.settings:get("MATRIX_USERNAME")
+MATRIX_PASSWORD = minetest.settings:get("MATRIX_PASSWORD")
+-- New settings for direct token login
+MATRIX_TOKEN = minetest.settings:get("MATRIX_TOKEN")
+MATRIX_USERID = minetest.settings:get("MATRIX_USERID")
+
+local http = minetest.request_http_api()
+if not http then
+    error("Please add matrix_bridge to secure.http_mods")
+end
+
+local function url_encode(str)
+    if not str then return "" end
+    str = str:gsub("\n", "\r\n")
+    str = str:gsub("([^%w%-_%.%~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+    return str
+end
 
 -- Ensure server URL doesn't have a trailing slash
 if MATRIX_SERVER and MATRIX_SERVER:sub(-1) == "/" then
     MATRIX_SERVER = MATRIX_SERVER:sub(1, -2)
 end
 
-local http = minetest.request_http_api()
-if http == nil then
-    error("Please add matrix_bridge to secure.http_mods")
-end
-
--- defines functions for matrix protocol
 local MatrixChat = {
     server   = MATRIX_SERVER,
     username = MATRIX_USERNAME,
     password = MATRIX_PASSWORD,
     room     = MATRIX_ROOM,
-    proxy    = MATRIX_HACK_PROXY,
-    token    = MATRIX_TOKEN,
-    userid   = MATRIX_USERID,
+    userid   = nil,
+    token    = nil,
     since    = nil,
     eventid  = nil
 }
+matrix_bridge = {}
 
-function MatrixChat:minechat(data)
-    if data == nil then return end
-    if self.since == data.next_batch then return end
-    if data["rooms"] == nil or data["rooms"]["join"] == nil then return end
-    if data["rooms"]["join"][self.room] == nil then return end
-    if data["rooms"]["join"][self.room]["timeline"] == nil then return end
+function matrix_bridge.send_as_server(message)
+    MatrixChat:send("[Server]: " .. message)
+end
 
-    local events = data["rooms"]["join"][self.room]["timeline"]["events"]
-    if events == nil then
-        minetest.log("action", "matrix_bridge - found timeline but no events")
-        return
+function matrix_bridge.send_raw(message)
+    MatrixChat:send(message)
+end
+
+-- ==========================================
+-- Session Persistence Methods
+-- ==========================================
+
+function MatrixChat:load_session()
+    self.token = storage:get_string("access_token")
+    self.userid = storage:get_string("user_id")
+    self.since = storage:get_string("since")
+
+    -- Fallback to config settings if mod storage is empty
+    if (not self.token or self.token == "") and MATRIX_TOKEN and MATRIX_TOKEN ~= "" then 
+        self.token = MATRIX_TOKEN 
+    end
+    if (not self.userid or self.userid == "") and MATRIX_USERID and MATRIX_USERID ~= "" then 
+        self.userid = MATRIX_USERID 
     end
 
+    if self.since == "" then self.since = nil end
+    
+    return (self.token and self.token ~= "")
+end
+
+function MatrixChat:save_session()
+    if self.token then storage:set_string("access_token", self.token) else storage:set_string("access_token", "") end
+    if self.userid then storage:set_string("user_id", self.userid) else storage:set_string("user_id", "") end
+    if self.since then storage:set_string("since", self.since) else storage:set_string("since", "") end
+end
+
+function MatrixChat:clear_session()
+    storage:set_string("access_token", "")
+    storage:set_string("user_id", "")
+    storage:set_string("since", "")
+    self.token = nil
+    self.userid = nil
+    self.since = nil
+end
+
+-- ==========================================
+-- Core Matrix Functions
+-- ==========================================
+
+function MatrixChat:join_room()
+    if not self.room or not self.token then return end
+    
+    local encoded_room = url_encode(self.room)
+    local url = self.server .. "/_matrix/client/v3/join/" .. encoded_room
+    
+    http.fetch({
+        url = url,
+        method = "POST",
+        extra_headers = {
+            "Authorization: Bearer " .. self.token,
+            "Content-Type: application/json"
+        },
+        post_data = "{}"
+    }, function(res)
+        if res.code == 200 then
+            local data = minetest.parse_json(res.data)
+            if data and data.room_id then
+                self.room = data.room_id -- CRITICAL: Swaps alias for real ID
+                minetest.log("action", "[matrix_bridge] Joined! Room ID is now: " .. self.room)
+                matrix_bridge.send_as_server("Server is online!")
+            end
+        else
+            minetest.log("error", "[matrix_bridge] Join failed: " .. res.code .. " " .. (res.data or ""))
+        end
+    end)
+end
+
+-- Parse incoming messages from Matrix
+function MatrixChat:minechat(data)
+    if not data or self.since == data.next_batch then return end
+    local timeline = data.rooms and data.rooms.join and data.rooms.join[self.room] and data.rooms.join[self.room].timeline
+    if not timeline or not timeline.events then
+        return
+    end
+    
     minetest.log("action", "matrix_bridge - sync'd and found new messages")
-    for i, event in ipairs(events) do
+    for _, event in ipairs(timeline.events) do
         if event.type == "m.room.message" and event.sender ~= self.userid then
-            -- Structural fix: Fallback to string if body content is absent
-            local body_content = (event.content and event.content.body) or "<non-text message>"
-            local message = event.sender .. ": " .. body_content
+            -- Clean the sender username handle (e.g., @usr40k:matrix.org -> usr40k)
+            local matrix_user = event.sender:match("@([^:]+):") or event.sender
+            local message_content = event.content.body
             
-            minetest.log("action", message)
-            
-            -- Prevent recursive chat reflection back loops
-            local old_sendall = minetest.chat_send_all
-            minetest.chat_send_all = function(text) minetest.log("action", "[Matrix Echo Bypassed]: " .. text) end
-            minetest.chat_send_all(message)
-            minetest.chat_send_all = old_sendall
+            if rawget(_G, "chat_channels") and chat_channels.send then
+                
+                -- Mode 2 prints to the channel but DOES NOT echo it back to the out-bound Matrix API
+                chat_channels.send(matrix_user, "global", message_content, 2)
+            else
+                -- Native Luanti absolute fallback layout if chat_channels fails to resolve dynamically
+                local fallback_msg = "[Matrix] <" .. matrix_user .. ">: " .. message_content
+                minetest.chat_send_all(fallback_msg)
+            end
         end
     end
 end
 
--- GET /sync
+-- Build sync request
 function MatrixChat:get_sync_table(timeout)
     local params = {}
-    if self.since ~= nil then table.insert(params, "since=" .. self.since) end
-    if timeout ~= nil then table.insert(params, "timeout=" .. timeout) end
+    if self.since and self.since ~= "" then table.insert(params, "since=" .. url_encode(self.since)) end
+    if timeout then table.insert(params, "timeout=" .. timeout) end
     
-    local u = self.server .."/_matrix/client/r0/sync"
-    if #params > 0 then u = u .. "?" .. table.concat(params, "&") end
+    -- REVERTED: Changed back to /v3/sync which is natively supported
+    local url = self.server .. "/_matrix/client/v3/sync"
+    if #params > 0 then url = url .. "?" .. table.concat(params, "&") end
     
-    local h = {
-        "Authorization: Bearer " .. (self.token or ""),
-        "Accept-Encoding: identity",
-        "Host: " .. MATRIX_SERVERNAME
+    local headers = {
+        "Authorization: Bearer " .. self.token,
+        "Accept-Encoding: identity"
     }
-    return {url=u, method="GET", extra_headers=h}
+    
+    return {
+        url = url, 
+        method = "GET", -- Force GET explicitly
+        extra_headers = headers
+    }
 end
 
+-- Perform sync
 function MatrixChat:sync(timeout)
-    if self.token == nil or self.token == "" then return end
+    if not self.token then return end
+    HANDLE = nil 
     
-    local raw_req = MatrixChat:get_sync_table(timeout)
-    local clean_req = {
-        url = raw_req.url,
-        method = "GET",
-        extra_headers = raw_req.extra_headers
-    }
-    
-    http.fetch(clean_req, function(res)
-        if res == nil then 
+    http.fetch(self:get_sync_table(timeout), function(res)
+        if not res then
             minetest.log("error", "matrix_bridge - sync response is nil")
         elseif res.code == 200 then
             local response = minetest.parse_json(res.data)
-            if response ~= nil then
-                MatrixChat:minechat(response)
-                MatrixChat.since = response.next_batch
+            if response then
+                self:minechat(response)
+                if response.next_batch then
+                    self.since = response.next_batch
+                    self:save_session()
+                end
+            end
+        else
+            minetest.log("error", "matrix_bridge - manual sync failed with code " .. res.code)
+            -- Clear out corrupted sync token if the host flags it as bad
+            if res.code == 400 or res.code == 405 then
+                self.since = nil
+                self:save_session()
             end
         end
     end)
 end
 
--- POST /login
+-- Login to Matrix
 function MatrixChat:login()
-    -- Bypass authentication step if token was directly provided via settings
-    if self.token and self.token ~= "" then
-        minetest.log("action", "matrix_bridge - Logged in via static settings token")
-        MatrixChat:sync()
-        MatrixChat:send("*** Server connected to the matrix via static configuration token")
+    if not self.server or self.server == "" then
+        minetest.log("error", "matrix_bridge - MATRIX_SERVER is not defined in settings!")
         return
     end
 
-    local u = self.server .."/_matrix/client/r0/login"
-    local d = minetest.write_json{
-        type="m.login.password",
-        password=self.password,
-        identifier={
-            type="m.id.user",
-            user=self.username
-        }
+    if self:load_session() then
+        minetest.log("action", "matrix_bridge - Logged in using saved session/token")
+        self:join_room()
+        self:sync()
+        return
+    end
+
+    if not self.username or self.username == "" or not self.password or self.password == "" then
+        minetest.log("error", "matrix_bridge - No token available and missing username/password in settings.")
+        return
+    end
+
+    local url = self.server .. "/_matrix/client/v3/login"
+    local payload = {
+        type = "m.login.password",
+        identifier = {type = "m.id.user", user = self.username},
+        password = self.password
     }
-    local h = {
+    local headers = {
         "Content-Type: application/json",
-        "Accept-Encoding: identity",
-        "Host: " .. MATRIX_SERVERNAME
+        "Accept-Encoding: identity"
     }
-    http.fetch({url=u, method="POST", extra_headers=h, data=d}, function(res)
+    http.fetch({
+        url = url,
+        method = "POST",
+        extra_headers = headers,
+        post_data = minetest.write_json(payload)
+    }, function(res)
         if res.code == 200 then
             local data = minetest.parse_json(res.data)
-            if data.access_token ~= nil and data.user_id ~= nil then
-                self.token  = data.access_token
+            if data and data.access_token and data.user_id then
+                self.token = data.access_token
                 self.userid = data.user_id
-                MatrixChat:sync()
-                minetest.log("action", "Matrix authenticated")
-                MatrixChat:send("*** Server connected to the matrix")
+                self:save_session() 
+                minetest.log("action", "matrix_bridge - Matrix authenticated with password")
+                self:join_room()
+                self:sync()
             else
-                minetest.log("error", "Matrix login failed")
+                minetest.log("error", "matrix_bridge - login response missing token or user_id")
             end
         else
-            minetest.log("error", "Matrix login failed with code " .. tostring(res.code))
+            minetest.log("error", "matrix_bridge - login failed with code " .. res.code)
         end
     end)
 end
 
--- PUT /rooms/{roomId}/send/{eventType}/{txnId}
+-- Send message to Matrix room
 function MatrixChat:send(msg)
-    if self.token == nil or self.token == "" then return end
-    local txid = tostring(os.time()) .. "_" .. tostring(math.random(100, 999))
-    local u = self.server .."/_matrix/client/r0/rooms/".. self.room .."/send/m.room.message/" .. txid
-    local h = {
-        "Content-Type: application/json",
+    if not self.token then return end
+    local txid = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999))
+    local url = self.server .. "/_matrix/client/r0/rooms/" .. self.room .. "/send/m.room.message/" .. txid
+    local headers = {
         "Authorization: Bearer " .. self.token,
-        "Accept-Encoding: identity",
-        "Host: " .. MATRIX_SERVERNAME
+        "Content-Type: application/json",
+        "Accept-Encoding: identity"
     }
-    local d = minetest.write_json({msgtype="m.text", body=msg})
-    local req
-    if self.proxy then
-        req = {url=u, method="POST", extra_headers=h, post_data=d}
-    else
-        req = {url=u, method="PUT", extra_headers=h, data=d}
-    end
+    local payload = {
+        msgtype = "m.text",
+        body = msg
+    }
+    local req = {
+        url = url,
+        method = "PUT",
+        extra_headers = headers,
+        data = minetest.write_json(payload)
+    }
     http.fetch(req, function(res)
         if res.code == 200 then
             local data = minetest.parse_json(res.data)
-            if data then self.eventid = data["event_id"] end
+            if data and data.event_id then
+                self.eventid = data.event_id
+                minetest.log("action", "matrix_bridge - sent message, event_id: " .. data.event_id)
+            else
+                minetest.log("error", "matrix_bridge - cannot parse send response")
+            end
+        elseif res.code == 403 then
+            minetest.log("error", "matrix_bridge - forbidden: " .. res.data)
+        elseif res.code == 401 then
+            minetest.log("error", "matrix_bridge - not authorized to send messages")
+        elseif res.code == 404 then
+            minetest.log("error", "matrix_bridge - endpoint not found")
+        else
+            minetest.log("error", "matrix_bridge - send failed with code " .. res.code)
         end
     end)
 end
 
--- POST /logout/all
+-- Logout
 function MatrixChat:logout()
-    if not self.token or self.token == "" then return end
-    local u = self.server .."/logout/all"
-    local h = {
+    if not self.token then return end
+    local url = self.server .. "/_matrix/client/v3/logout"
+    local headers = {
         "Authorization: Bearer " .. self.token,
-        "Accept-Encoding: identity",
-        "Host: " .. MATRIX_SERVERNAME
+        "Accept-Encoding: identity"
     }
-    http.fetch({url=u, method="POST", extra_headers=h}, function(res) end)
-    minetest.log("action", "matrix_bridge - signing out.")
+    http.fetch({url = url, method = "POST", extra_headers = headers}, function(_) end)
+    self:clear_session() 
+    minetest.log("action", "matrix_bridge - signed out and session cleared")
 end
 
+-- Utility: print sync URL
 function MatrixChat:get_access_url()
-    local params = {}
-    if self.since ~= nil then table.insert(params, "since=" .. self.since) end
-    table.insert(params, "access_token=" .. (self.token or ""))
-    local u = self.server .. "/_matrix/client/r0/sync?" .. table.concat(params, "&")
-    print(u)
+    if not self.token then return end
+    local params = {"access_token=" .. self.token}
+    if self.since then table.insert(params, "since=" .. self.since) end
+    local url = self.server .. "/_matrix/client/v3/sync?" .. table.concat(params, "&")
+    print(url)
 end
 
--- FIXED LONG-POLLING ENGINE WRAPPER
-local INTERVAL = 30
-local HANDLE  = nil
+local clock = os.clock
+function sleep(time)
+    local startTime = clock()
+    local endTime = startTime + time
+    repeat
+        startTime = clock()
+    until (startTime >= endTime)
+end
+
+-- Global error handler
+local function global_error_handler(err)
+    local msg = "[Server]: Server is offline due to error: " .. tostring(err)
+    minetest.log("error", msg)
+    if MatrixChat and MatrixChat.send then
+        MatrixChat:send(msg)
+        sleep(2)
+        MatrixChat:logout()
+    end
+end
+
+-- Periodic sync
+local INTERVAL = 30 
+local HANDLE = nil
+local sync_cooldown = 0
 
 minetest.register_globalstep(function(dtime)
-    if MatrixChat.token == nil or MatrixChat.token == "" or #minetest.get_connected_players() == 0 then
+    if sync_cooldown > 0 then
+        sync_cooldown = sync_cooldown - dtime
         return
+    end
+
+    if not MatrixChat.token or #minetest.get_connected_players() == 0 then 
+        if HANDLE then HANDLE = nil end 
+        return 
     end
     
     if HANDLE == nil then
-        local raw_request = MatrixChat:get_sync_table(INTERVAL * 1000)
-        
-        -- FIX: Build an exact structural request object so cURL doesn't translate timeout into POST parameters
-        local request = {
-            url = raw_request.url,
-            method = "GET",
-            extra_headers = raw_request.extra_headers
-        }
-        
-        HANDLE = http.fetch_async(request)
+            local request = MatrixChat:get_sync_table(INTERVAL * 1000)
+            
+            -- FORCE THE ENGINE TO ONLY SEE A GET REQUEST:
+            request.method = "GET"
+            request.post_data = nil
+            request.data = nil        -- Explicitly wipe this so curl doesn't default to POST
+            
+            HANDLE = http.fetch_async(request)
     else
         local result = http.fetch_async_get(HANDLE)
+        
         if result and result.completed then
+            HANDLE = nil 
+            
             if result.code == 200 then
                 local activity = minetest.parse_json(result.data)
-                if activity ~= nil then
+                if activity then
                     MatrixChat:minechat(activity)
-                    MatrixChat.since = activity.next_batch
+                    if activity.next_batch then
+                        MatrixChat.since = activity.next_batch
+                        MatrixChat:save_session()
+                    end
+                end
+                sync_cooldown = 0 
+            else
+                minetest.log("error", "[matrix_bridge] background sync failed with code " .. tostring(result.code))
+                
+                -- Catch major failure states
+                if result.code == 0 or result.code == 405 or result.code == 404 then
+                    minetest.log("action", "[matrix_bridge] Sync issues hit. Cooling down for 15 seconds...")
+                    
+                    -- REMOVED: Do not clear MatrixChat.since on 405 here, otherwise you invalidate 
+                    -- your tracking position just because the proxy/engine flipped the request type.
+                    
+                    sync_cooldown = 15
+                else
+                    sync_cooldown = 5 
                 end
             end
-            HANDLE = nil
         end
     end
 end)
 
+-- Chat and player events
 minetest.register_privilege("matrix", {
     description = "Manage matrix bridge session",
     give_to_singleplayer = true,
@@ -234,7 +400,7 @@ minetest.register_privilege("matrix", {
 })
 
 minetest.register_chatcommand("matrix", {
-    privs = { matrix = true },
+    privs = {matrix = true},
     func = function(name, param)
         if param == "sync" then
             MatrixChat:sync()
@@ -247,64 +413,51 @@ minetest.register_chatcommand("matrix", {
             return true, "[matrix_bridge] command: log in"
         elseif param == "print" then
             MatrixChat:get_access_url()
-            return true, "[matrix_bridge] printed url to server console"
+            return true, "[matrix_bridge] printed URL to server console"
         end
     end
 })
 
-minetest.register_on_shutdown(function()
-    MatrixChat:logout()
-end)
+-- Wrap mod init in xpcall
+local function safe_mod_init()
+    if rawget(_G, "chat_channels") == nil then
+        minetest.register_on_chat_message(function(name, message)
+            if message:sub(1, 1) == "/" or message:sub(1, 5) == "[off]" or not minetest.check_player_privs(name, {shout = true}) then
+                return
+            end
+            local nl = message:find("\n", 1, true)
+            if nl then message = message:sub(1, nl - 1) end
+            MatrixChat:send("[" .. name .. "]: " .. message)
+        end)
+    end
+    MatrixChat:login()
+end
 
-minetest.register_on_joinplayer(function(player)
+minetest.register_on_joinplayer(function(player, last_login)
     local name = player:get_player_name()
-    MatrixChat:send("*** " .. name .. " joined the game")
+    MatrixChat:send("[Server]: " .. name .. " joined the game" .. (last_login and ", welcome back!" or " for the first time. Welcome and have a great stay!"))
 end)
 
 minetest.register_on_leaveplayer(function(player, timed_out)
     local name = player:get_player_name()
-    MatrixChat:send("*** " .. name .. " left the game" .. (timed_out and " (Timed out)" or ""))
+    MatrixChat:send("[Server]: " .. name .. " left the game" .. (timed_out and " (Timed out)" or ", see you again soon!"))
 end)
 
-local stripall
-do
-    local string_gsub, string_char = string.gsub, string.char
-    local stripcolor = minetest.get_color_escape_sequence('#ffffff')
-    stripcolor = string_gsub(stripcolor, "%W", "%%%1")
-    stripcolor = string_gsub(stripcolor, "ffffff", "%%x+")
-
-    local striptrans = minetest.get_translator("12345")("67890")
-    striptrans = string_gsub(striptrans, "%W", "%%%1")
-    striptrans = string_gsub(striptrans, "12345", "%%S-")
-    striptrans = string_gsub(striptrans, "67890", "(%.-)")
-
-    local stripesc = "%" .. string_char(27) .. "%S"
-
-    function stripall(s)
-        s = string_gsub(s, stripcolor, "")
-        s = string_gsub(s, striptrans, "%1")
-        s = string_gsub(s, stripesc, "")
-        return s
+minetest.register_chatcommand("restart", {
+    params = "<message>",
+    description = "Send a restart message and shut down the server",
+    privs = {server = true},
+    func = function(name, param)
+        local msg = "[Server]: Server is restarting: " .. (param or "No reason given")
+        MatrixChat:send(msg)
+        sleep(1)
+        MatrixChat:logout()
+        sleep(1)
+        minetest.request_shutdown("Server is restarting: " .. (param or "No reason given"))
+        return true, "Restart initiated"
     end
-end
+})
 
-do
-    local old_sendall = minetest.chat_send_all
-    function minetest.chat_send_all(text, ...)
-        local t = stripall(text)
-        MatrixChat:send(t)
-        return old_sendall(text, ...)
-    end
-end
-
-minetest.register_on_chat_message(function(name, message)
-    if message:sub(1, 1) == "/" or message:sub(1, 5) == "[off]" or (not minetest.check_player_privs(name, {shout=true})) then
-        return
-    end
-    local nl = message:find("\n", 1, true)
-    if nl then message = message:sub(1, nl - 1) end
-    message = stripall(message)
-    MatrixChat:send("<" .. name .. "> " .. message)
+minetest.register_on_mods_loaded(function()
+    xpcall(safe_mod_init, global_error_handler)
 end)
-
-minetest.register_on_mods_loaded(function() MatrixChat:login() end)

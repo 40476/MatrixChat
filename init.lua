@@ -131,10 +131,11 @@ function MatrixChat:minechat(data)
         if event.type == "m.room.message" and event.sender ~= self.userid then
             -- Clean the sender username handle (e.g., @usr40k:matrix.org -> usr40k)
             local matrix_user = event.sender:match("@([^:]+):") or event.sender
-            local message_content = event.content.body
+            
+            -- FIX: Add structural safety and a fallback string if body is nil
+            local message_content = (event.content and event.content.body) or "<non-text or empty message>"
             
             if rawget(_G, "chat_channels") and chat_channels.send then
-                
                 -- Mode 2 prints to the channel but DOES NOT echo it back to the out-bound Matrix API
                 chat_channels.send(matrix_user, "global", message_content, 2)
             else
@@ -333,7 +334,7 @@ local function global_error_handler(err)
 end
 
 -- Periodic sync
-local INTERVAL = 30 
+local INTERVAL = 5 
 local HANDLE = nil
 local sync_cooldown = 0
 

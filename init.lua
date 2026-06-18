@@ -9,6 +9,7 @@ MATRIX_PASSWORD = minetest.settings:get("MATRIX_PASSWORD")
 -- New settings for direct token login
 MATRIX_TOKEN = minetest.settings:get("MATRIX_TOKEN")
 MATRIX_USERID = minetest.settings:get("MATRIX_USERID")
+MATRIX_SERVERNAME = minetest.settings:get("MATRIX_SERVERNAME")
 
 local http = minetest.request_http_api()
 if not http then
@@ -101,7 +102,8 @@ function MatrixChat:join_room()
         method = "POST",
         extra_headers = {
             "Authorization: Bearer " .. self.token,
-            "Content-Type: application/json"
+            "Content-Type: application/json",
+            "Host:" .. MATRIX_SERVERNAME
         },
         post_data = "{}"
     }, function(res)
@@ -159,7 +161,8 @@ function MatrixChat:get_sync_table(timeout)
     
     local headers = {
         "Authorization: Bearer " .. self.token,
-        "Accept-Encoding: identity"
+        "Accept-Encoding: identity",
+        "Host:" .. MATRIX_SERVERNAME
     }
     
     return {
@@ -224,7 +227,8 @@ function MatrixChat:login()
     }
     local headers = {
         "Content-Type: application/json",
-        "Accept-Encoding: identity"
+        "Accept-Encoding: identity",
+        "Host:" .. MATRIX_SERVERNAME
     }
     http.fetch({
         url = url,
@@ -258,7 +262,8 @@ function MatrixChat:send(msg)
     local headers = {
         "Authorization: Bearer " .. self.token,
         "Content-Type: application/json",
-        "Accept-Encoding: identity"
+        "Accept-Encoding: identity",
+        "Host:" .. MATRIX_SERVERNAME
     }
     local payload = {
         msgtype = "m.text",
@@ -297,7 +302,8 @@ function MatrixChat:logout()
     local url = self.server .. "/_matrix/client/v3/logout"
     local headers = {
         "Authorization: Bearer " .. self.token,
-        "Accept-Encoding: identity"
+        "Accept-Encoding: identity",
+        "Host:" .. MATRIX_SERVERNAME
     }
     http.fetch({url = url, method = "POST", extra_headers = headers}, function(_) end)
     self:clear_session() 

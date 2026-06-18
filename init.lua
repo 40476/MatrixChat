@@ -1,8 +1,5 @@
 local modpath = minetest.get_modpath(minetest.get_current_modname())
 
-dofile(modpath.."/config.lua")
-dofile(modpath.."/debug.lua")
-
 -- Load settings directly from minetest.settings
 local MATRIX_SERVER = minetest.settings:get("MATRIX_SERVER")
 local MATRIX_ROOM = minetest.settings:get("MATRIX_ROOM")
